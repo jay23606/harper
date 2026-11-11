@@ -6696,13 +6696,7 @@ export function makeTable(options): TableResourceClass {
 					// from the last attempt's skipped state launders when a recommit round self-skips
 					// (walk identity tie against its own staged record) before a fresh-transaction replay.
 					const stagedOwnAuditEntry = retry && write.appendedAuditEntry === true;
-					// Only an entry appended with abort markers off can be this write's own orphan: with markers a
-					// committed reader skips an aborted batch and stops before an unresolved one. Until the log
-					// holding this write's identity is all marker-era, another attempt's orphan can still match it,
-					// which a first attempt that ran in order never looked up.
-					const mayReadOwnOrphan =
-						stagedOwnAuditEntry &&
-						(write.appendedUnmarkedAuditEntry === true || !auditHistoryAbortMarked(auditStore, options?.nodeId));
+					const mayReadOwnOrphan = canReadOwnOrphan(write, retry, options?.nodeId);
 					write.skipped = false; // reset on each retry; cleanup happens after commit if still true
 					write.stagedEntry = undefined; // likewise: only set once this round actually stores a record
 					write.completeResidencyRecord = undefined;
@@ -11129,10 +11123,25 @@ export function makeTable(options): TableResourceClass {
 					(this.constructor as any).source?.publish && !(context as any)?.source
 						? (this.constructor as any).source.publish.bind((this.constructor as any).source, id, message, context)
 						: undefined,
-				commit: (txnTime, existingEntry, _retry, transaction: any) => {
+				commit: (txnTime, existingEntry, retry, transaction: any, committedBy?: DatabaseTransaction) => {
+					write.skipped = false; // reset on each retry
 					write.stagedEntry = undefined;
 					write.completeResidencyRecord = undefined;
 					write.superseded = false;
+					// The record keeps only the latest message's version, so an earlier message's re-delivery cannot tie
+					// against it: the entry its first delivery logged is the proof it applied, and re-applying it logs an
+					// entry subscribers receive again. A message newer than the record's version has not applied.
+					if (
+						committedBy?.sourceApply &&
+						!committedBy.isReplay &&
+						isRocksDB &&
+						!(existingEntry && precedesExistingVersion(txnTime, existingEntry, options?.nodeId) > 0) &&
+						!canReadOwnOrphan(write, retry, options?.nodeId) &&
+						isMessageLogged((context as any)?.timestamp, id, options?.nodeId, options?.version ?? txnTime)
+					) {
+						write.skipped = true;
+						return;
+					}
 					if (existingEntry === undefined && trackDeletes && !audit) {
 						scheduleCleanup();
 					}
@@ -14134,6 +14143,45 @@ export function makeTable(options): TableResourceClass {
 	 */
 	function isStubLeftBy(entry: Partial<Entry> | undefined, txnLogKey: number, nodeId: number | undefined): boolean {
 		return Boolean(entry?.metadataFlags & INVALIDATED) && isAuditEntryWrite(entry, { txnLogKey, nodeId });
+	}
+
+	/**
+	 * Whether origin `nodeId`'s committed log holds a message for `id` in this table at `txnLogKey` and `version`. One
+	 * origin transaction applies in one transaction here, so one of its messages for `id` proves all of them applied.
+	 */
+	function isMessageLogged(
+		txnLogKey: number | undefined,
+		id: Id,
+		nodeId: number | undefined,
+		version: number
+	): boolean {
+		// an unnamed origin's entries sit in `local` under minted keys, never at its received key
+		if (txnLogKey === undefined || !nodeId || !auditStore.logById(nodeId)) return false;
+		for (const entry of auditStore.getRange({ start: txnLogKey, exactStart: true, log: nodeId })) {
+			if (entry.txnLogKey !== txnLogKey) return false;
+			if (
+				entry.type === 'message' &&
+				entry.tableId === tableId &&
+				entry.version === version &&
+				compareKeys(entry.recordId, id) === 0
+			)
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Whether a re-delivery lookup could find this write's own entry from an aborted attempt. Sticky per write: log
+	 * entries survive the aborted rocks transaction. Only one appended with abort markers off counts: with markers
+	 * a committed reader skips an aborted batch and stops before an unresolved one, but until the log holding this
+	 * write's identity is all marker-era, another attempt's orphan can still match it.
+	 */
+	function canReadOwnOrphan(write: any, retry: boolean, nodeId: number | undefined): boolean {
+		return (
+			retry &&
+			write.appendedAuditEntry === true &&
+			(write.appendedUnmarkedAuditEntry === true || !auditHistoryAbortMarked(auditStore, nodeId))
+		);
 	}
 
 	// Not stagedEntry: a relocate restamps the record without staging it, and a publish's restamp counts too.
