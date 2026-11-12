@@ -9,6 +9,7 @@ const { table } = require('#src/resources/databases');
 const { setMainIsWorker } = require('#src/server/threads/manageThreads');
 const { transaction } = require('#src/resources/transaction');
 const { getIdOfRemoteNode } = require('#src/resources/nodeIdMapping');
+const { setAbortMarkersForTests } = require('#src/resources/transactionLogAbortMarkers');
 
 // LMDB keys its log by local time, so an applied publish carries no origin log key to find it by.
 const isLMDB = process.env.HARPER_STORAGE_ENGINE === 'lmdb';
@@ -160,25 +161,41 @@ describe('Re-delivered replicated publishes', function () {
 		assert.deepEqual(received, ['sensor/10:1']);
 	});
 
-	it('delivers each publish of a wide re-delivered transaction once, reading the log once per delivery', async () => {
+	it('reads the log once per delivery of a wide transaction', async () => {
 		const logKey = originClock();
 		const frame = Array.from({ length: 2000 }, (_, n) => ({ id: `wide/${n}`, n }));
-		await applyFrame(logKey, frame);
+		const log = Topics.auditStore.logById(peer);
+		const originalQuery = log.query;
 		const originalRange = Topics.auditStore.getRange;
-		let reads = 0;
+		const reads = { probes: 0, ranges: 0 };
+		// rocksdb-js defines query as non-writable
+		Object.defineProperty(log, 'query', {
+			configurable: true,
+			value(options, ...args) {
+				if (options?.start === logKey) reads.probes++;
+				return originalQuery.call(this, options, ...args);
+			},
+		});
 		Topics.auditStore.getRange = function (options, ...args) {
-			if (options?.start === logKey) reads++;
+			if (options?.start === logKey) reads.ranges++;
 			return originalRange.call(this, options, ...args);
 		};
-		try {
+		const counted = async () => {
+			reads.probes = reads.ranges = 0;
 			await applyFrame(logKey, frame);
+			return { ...reads };
+		};
+		try {
+			assert.deepEqual(await counted(), { probes: 1, ranges: 0 }, 'a first delivery');
+			// the probe, then one decoded range read, which queries the log itself
+			assert.deepEqual(await counted(), { probes: 2, ranges: 1 }, 'a re-delivery');
 		} finally {
+			delete log.query;
 			Topics.auditStore.getRange = originalRange;
 		}
 		await drain();
 		assert.equal(received.length, 2000);
 		assert.equal(new Set(received).size, 2000);
-		assert.equal(reads, 1);
 	});
 
 	it('delivers publishes from two origins at the same key and topic', async () => {
@@ -218,6 +235,19 @@ describe('Re-delivered replicated publishes', function () {
 			['sensor/7:1']
 		);
 		assert.equal((await Topics.get('sensor/7')).n, 'retained');
+	});
+
+	it('applies a re-delivered publish again when this node writes no abort markers', async () => {
+		const prior = setAbortMarkersForTests(false);
+		try {
+			const logKey = originClock();
+			await applyFrame(logKey, [{ id: 'sensor/11', n: 1 }]);
+			await applyFrame(logKey, [{ id: 'sensor/11', n: 1 }]);
+			await drain();
+			assert.deepEqual(received, ['sensor/11:1', 'sensor/11:1']);
+		} finally {
+			setAbortMarkersForTests(prior ?? true);
+		}
 	});
 
 	it('still delivers every local publish', async () => {
