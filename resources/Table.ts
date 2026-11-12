@@ -11135,21 +11135,30 @@ export function makeTable(options): TableResourceClass {
 						? (this.constructor as any).source.publish.bind((this.constructor as any).source, id, message, context)
 						: undefined,
 				commit: (txnTime, existingEntry, retry, transaction: any, committedBy?: DatabaseTransaction) => {
-					write.skipped = false; // reset on each retry
+					write.skipped = false;
 					write.stagedEntry = undefined;
 					write.completeResidencyRecord = undefined;
 					write.superseded = false;
 					// A message leaves no record version a re-delivery could tie against (a late one lowers it), so the
-					// entry its first delivery logged is the proof it applied. Only a writer that marks aborted batches
-					// leaves no orphan a fresh delivery could take for that entry, and a retry recommits the entry its
-					// first attempt staged, so only an attempt that staged none can skip.
+					// entry its first delivery logged is the proof it applied. A retry recommits the entry its first
+					// attempt staged, so only an attempt that staged none can skip. An aborted batch is marked only by a
+					// writer with markers on: in a file an earlier process wrote, the entry also needs the record to
+					// have reached this version, which an aborted publish never stamped.
 					if (
 						committedBy?.sourceApply &&
 						!committedBy.isReplay &&
 						isRocksDB &&
 						abortMarkersEnabled() &&
 						!(retry && write.appendedAuditEntry === true) &&
-						isMessageLogged(committedBy, (context as any)?.timestamp, id, options?.nodeId, options?.version ?? txnTime)
+						isMessageLogged(
+							committedBy,
+							(context as any)?.timestamp,
+							id,
+							options?.nodeId,
+							options?.version ?? txnTime
+						) &&
+						(auditHistoryAbortMarked(auditStore, options?.nodeId) ||
+							(existingEntry !== undefined && precedesExistingVersion(txnTime, existingEntry, options?.nodeId) <= 0))
 					) {
 						write.skipped = true;
 						return;
@@ -14182,7 +14191,7 @@ export function makeTable(options): TableResourceClass {
 	}
 
 	function loggedMessagesAt(log: any, txnLogKey: number, nodeId: number): Set<string> | null {
-		// the log's own probe answers a first delivery's miss without decoding a range
+		// a first delivery's miss, without decoding a range
 		let probe;
 		try {
 			probe = log.query({ start: txnLogKey, exactStart: true });

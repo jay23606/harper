@@ -1,6 +1,5 @@
-// A replicated publish is a message, not a record, so no stored version ties a re-delivery to it. A resume
-// re-streams the origin's log from below what this node applied, and every re-applied publish is a new log
-// entry that live subscribers receive again.
+// A replicated publish stores no record version a re-delivery could tie against: only the entry its first
+// delivery logged shows it applied.
 require('../testUtils');
 const assert = require('node:assert');
 const { setupTestDBPath } = require('../testUtils');
@@ -85,7 +84,6 @@ describe('Re-delivered replicated publishes', function () {
 		for (const [i, logKey] of keys.entries()) await applyFrame(logKey, [{ id: 'sensor/run', n: i }]);
 		const newer = originClock();
 		await applyFrame(newer, [{ id: 'sensor/run', n: 3 }]);
-		// a resume from below the first key re-streams all four
 		for (const [i, logKey] of [...keys, newer].entries()) await applyFrame(logKey, [{ id: 'sensor/run', n: i }]);
 		await drain();
 		assert.deepEqual(received, ['sensor/run:0', 'sensor/run:1', 'sensor/run:2', 'sensor/run:3']);
@@ -146,7 +144,6 @@ describe('Re-delivered replicated publishes', function () {
 		const newer = originClock();
 		await applyFrame(newer, [{ id: 'sensor/9', n: 2 }]);
 		await applyFrame(late, [{ id: 'sensor/9', n: 1 }]);
-		// a resume from below both re-sends them in the origin's commit order
 		await applyFrame(newer, [{ id: 'sensor/9', n: 2 }]);
 		await applyFrame(late, [{ id: 'sensor/9', n: 1 }]);
 		await drain();
@@ -235,6 +232,60 @@ describe('Re-delivered replicated publishes', function () {
 			['sensor/7:1']
 		);
 		assert.equal((await Topics.get('sensor/7')).n, 'retained');
+	});
+
+	it('in a log an earlier process wrote, skips a re-delivered publish only once its record reached it', async () => {
+		const logName = Topics.auditStore.logById(peer).name;
+		const prior = Topics.auditStore.abortMarkedHistory;
+		Topics.auditStore.abortMarkedHistory = {
+			baseline: new Map([[logName, Number.MAX_SAFE_INTEGER]]),
+			recheckAt: new Map([[logName, Infinity]]),
+		};
+		try {
+			const late = originClock();
+			const newer = originClock();
+			await applyFrame(newer, [{ id: 'sensor/12', n: 2 }]);
+			await applyFrame(newer, [{ id: 'sensor/12', n: 2 }]);
+			await applyFrame(late, [{ id: 'sensor/12', n: 1 }]);
+			// the late message left the record below the newer one, as an aborted publish would
+			await applyFrame(newer, [{ id: 'sensor/12', n: 2 }]);
+			await drain();
+			assert.deepEqual(received, ['sensor/12:2', 'sensor/12:1', 'sensor/12:2']);
+		} finally {
+			Topics.auditStore.abortMarkedHistory = prior;
+		}
+	});
+
+	it('delivers a re-delivered publish to a table without an audit log once', async () => {
+		const Unaudited = table({
+			table: 'RedeliveredPublishesUnaudited',
+			database: 'redeliveredPublishes',
+			attributes: [{ name: 'id', isPrimaryKey: true }, { name: 'n' }],
+			audit: false,
+		});
+		const deliveries = [];
+		const unauditedSubscription = await Unaudited.subscribe({ isCollection: true, omitCurrent: true });
+		unauditedSubscription.on('data', (event) => {
+			if (event.type === 'message') deliveries.push(`${event.id}:${event.value?.n}`);
+		});
+		try {
+			const apply = (logKey, id, n) => {
+				const context = { source: {}, sourceApply: true, timestamp: logKey };
+				return transaction(context, async () => {
+					const resource = await Unaudited.getResource(id, context);
+					resource._writePublish(id, { n }, { isNotification: true, nodeId: peer, version: logKey });
+				});
+			};
+			const logKey = originClock();
+			await apply(logKey, 'sensor/13', 1);
+			await apply(logKey, 'sensor/13', 1);
+			const marker = originClock();
+			await apply(marker, 'marker', 0);
+			await waitFor(() => deliveries.includes('marker:0'), { timeout: 5000, message: 'marker not delivered' });
+			assert.deepEqual(deliveries, ['sensor/13:1', 'marker:0']);
+		} finally {
+			unauditedSubscription.end();
+		}
 	});
 
 	it('applies a re-delivered publish again when this node writes no abort markers', async () => {
