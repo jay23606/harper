@@ -189,8 +189,8 @@ describe('Re-delivered replicated publishes', function () {
 		} finally {
 			delete log.query;
 			Topics.auditStore.getRange = originalRange;
+			await drain();
 		}
-		await drain();
 		assert.equal(received.length, 2000);
 		assert.equal(new Set(received).size, 2000);
 	});
