@@ -11139,11 +11139,9 @@ export function makeTable(options): TableResourceClass {
 					write.stagedEntry = undefined;
 					write.completeResidencyRecord = undefined;
 					write.superseded = false;
-					// A message leaves no record version a re-delivery could tie against (a late one lowers it), so the
-					// entry its first delivery logged is the proof it applied. A retry recommits the entry its first
-					// attempt staged, so only an attempt that staged none can skip. An aborted batch is marked only by a
-					// writer with markers on: in a file an earlier process wrote, the entry also needs the record to
-					// have reached this version, which an aborted publish never stamped.
+					// The logged entry is the only proof a message applied (a late one lowers the record's version). A retry
+					// recommits the batch its first attempt staged; an earlier process's file can hold an unmarked aborted
+					// batch, so there the record must also have reached this version.
 					if (
 						committedBy?.sourceApply &&
 						!committedBy.isReplay &&
@@ -14167,7 +14165,6 @@ export function makeTable(options): TableResourceClass {
 	}
 
 	/**
-	 * Whether origin `nodeId`'s committed log here holds a message for `id` in this table at `txnLogKey` and `version`.
 	 * An origin transaction commits here all at once, so one read answers for all its messages for the applying
 	 * transaction; no write that staged its entry asks again on a retry.
 	 */
@@ -14191,7 +14188,6 @@ export function makeTable(options): TableResourceClass {
 	}
 
 	function loggedMessagesAt(log: any, txnLogKey: number, nodeId: number): Set<string> | null {
-		// a first delivery's miss, without decoding a range
 		let probe;
 		try {
 			probe = log.query({ start: txnLogKey, exactStart: true });

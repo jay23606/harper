@@ -184,7 +184,7 @@ describe('Re-delivered replicated publishes', function () {
 		};
 		try {
 			assert.deepEqual(await counted(), { probes: 1, ranges: 0 }, 'a first delivery');
-			// the probe, then one decoded range read, which queries the log itself
+			// a decoded range read queries the log too
 			assert.deepEqual(await counted(), { probes: 2, ranges: 1 }, 'a re-delivery');
 		} finally {
 			delete log.query;
