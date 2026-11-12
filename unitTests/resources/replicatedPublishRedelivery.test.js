@@ -140,6 +140,47 @@ describe('Re-delivered replicated publishes', function () {
 		assert.deepEqual(received, ['sensor/4:2', 'sensor/4:1']);
 	});
 
+	it('delivers a newer publish once when a late publish to its topic applied after it', async () => {
+		const late = originClock();
+		const newer = originClock();
+		await applyFrame(newer, [{ id: 'sensor/9', n: 2 }]);
+		await applyFrame(late, [{ id: 'sensor/9', n: 1 }]);
+		// a resume from below both re-sends them in the origin's commit order
+		await applyFrame(newer, [{ id: 'sensor/9', n: 2 }]);
+		await applyFrame(late, [{ id: 'sensor/9', n: 1 }]);
+		await drain();
+		assert.deepEqual(received, ['sensor/9:2', 'sensor/9:1']);
+	});
+
+	it('delivers a publish whose version differs from its log key once', async () => {
+		const logKey = originClock();
+		await applyFrame(logKey, [{ id: 'sensor/10', n: 1, version: logKey - 5_000 }]);
+		await applyFrame(logKey, [{ id: 'sensor/10', n: 1, version: logKey - 5_000 }]);
+		await drain();
+		assert.deepEqual(received, ['sensor/10:1']);
+	});
+
+	it('delivers each publish of a wide re-delivered transaction once, reading the log once per delivery', async () => {
+		const logKey = originClock();
+		const frame = Array.from({ length: 2000 }, (_, n) => ({ id: `wide/${n}`, n }));
+		await applyFrame(logKey, frame);
+		const originalRange = Topics.auditStore.getRange;
+		let reads = 0;
+		Topics.auditStore.getRange = function (options, ...args) {
+			if (options?.start === logKey) reads++;
+			return originalRange.call(this, options, ...args);
+		};
+		try {
+			await applyFrame(logKey, frame);
+		} finally {
+			Topics.auditStore.getRange = originalRange;
+		}
+		await drain();
+		assert.equal(received.length, 2000);
+		assert.equal(new Set(received).size, 2000);
+		assert.equal(reads, 1);
+	});
+
 	it('delivers publishes from two origins at the same key and topic', async () => {
 		const logKey = originClock();
 		await applyFrame(logKey, [{ id: 'sensor/5', n: 1 }]);

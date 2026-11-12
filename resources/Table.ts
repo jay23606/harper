@@ -221,7 +221,7 @@ import {
 	GET_TRACKED_WRITE_GENERATION,
 } from './tracked.ts';
 import { transaction, contextStorage } from './transaction.ts';
-import { MAXIMUM_KEY, writeKey, compareKeys } from 'ordered-binary';
+import { MAXIMUM_KEY, writeKey, compareKeys, toBufferKey } from 'ordered-binary';
 import {
 	getWorkerIndex,
 	applicationWorkerIndex,
@@ -387,6 +387,11 @@ type MaybePromise<T> = T | Promise<T>;
 const NULL_WITH_TIMESTAMP = new Uint8Array(9);
 NULL_WITH_TIMESTAMP[8] = 0xc0; // null
 const sourceWriteTypes = new Set(['put', 'patch', 'delete', 'publish', 'message', 'invalidate', 'relocate']);
+/** Per applying transaction, the messages each received origin transaction already logged here (`isMessageLogged`). */
+const loggedMessagesByTransaction = new WeakMap<object, Map<string, Set<string>>>();
+// storage-key encoding, so ids the store treats as one key match
+const messageIdentity = (tableId: number, id: Id, version: number) =>
+	`${tableId}:${version}:${toBufferKey(id).toString('latin1')}`;
 const isSourceWriteType = (type: string) => sourceWriteTypes.has(type);
 // declared types `validate` holds to one value on validated writes: `ID` admits an array of strings
 const SCALAR_TYPES = new Set(['String', 'Int', 'Long', 'Float', 'Boolean', 'Date', 'BigInt']);
@@ -11128,16 +11133,14 @@ export function makeTable(options): TableResourceClass {
 					write.stagedEntry = undefined;
 					write.completeResidencyRecord = undefined;
 					write.superseded = false;
-					// The record keeps only the latest message's version, so an earlier message's re-delivery cannot tie
-					// against it: the entry its first delivery logged is the proof it applied, and re-applying it logs an
-					// entry subscribers receive again. A message newer than the record's version has not applied.
+					// A message leaves no record version a re-delivery could tie against: the entry its first delivery
+					// logged is the proof it applied, and re-applying it logs an entry subscribers receive again.
 					if (
 						committedBy?.sourceApply &&
 						!committedBy.isReplay &&
 						isRocksDB &&
-						!(existingEntry && precedesExistingVersion(txnTime, existingEntry, options?.nodeId) > 0) &&
 						!canReadOwnOrphan(write, retry, options?.nodeId) &&
-						isMessageLogged((context as any)?.timestamp, id, options?.nodeId, options?.version ?? txnTime)
+						isMessageLogged(committedBy, (context as any)?.timestamp, id, options?.nodeId, options?.version ?? txnTime)
 					) {
 						write.skipped = true;
 						return;
@@ -14146,28 +14149,50 @@ export function makeTable(options): TableResourceClass {
 	}
 
 	/**
-	 * Whether origin `nodeId`'s committed log holds a message for `id` in this table at `txnLogKey` and `version`. One
-	 * origin transaction applies in one transaction here, so one of its messages for `id` proves all of them applied.
+	 * Whether origin `nodeId`'s committed log here holds a message for `id` in this table at `txnLogKey` and `version`.
+	 * An origin transaction applies in one transaction here, so its messages are read once per applying transaction.
 	 */
 	function isMessageLogged(
+		applying: DatabaseTransaction,
 		txnLogKey: number | undefined,
 		id: Id,
 		nodeId: number | undefined,
 		version: number
 	): boolean {
+		if (txnLogKey === undefined || !nodeId) return false;
 		// an unnamed origin's entries sit in `local` under minted keys, never at its received key
-		if (txnLogKey === undefined || !nodeId || !auditStore.logById(nodeId)) return false;
-		for (const entry of auditStore.getRange({ start: txnLogKey, exactStart: true, log: nodeId })) {
-			if (entry.txnLogKey !== txnLogKey) return false;
-			if (
-				entry.type === 'message' &&
-				entry.tableId === tableId &&
-				entry.version === version &&
-				compareKeys(entry.recordId, id) === 0
-			)
-				return true;
+		const log = auditStore.logById(nodeId);
+		if (!log) return false;
+		let byOriginKey = loggedMessagesByTransaction.get(applying);
+		if (!byOriginKey) loggedMessagesByTransaction.set(applying, (byOriginKey = new Map()));
+		const originKey = `${nodeId}:${txnLogKey}`;
+		let logged = byOriginKey.get(originKey);
+		if (logged === undefined) {
+			logged = loggedMessagesAt(log, txnLogKey, nodeId);
+			byOriginKey.set(originKey, logged);
 		}
-		return false;
+		return logged !== null && logged.has(messageIdentity(tableId, id, version));
+	}
+
+	/** The identities of the messages logged at `txnLogKey` in origin `nodeId`'s log, or null when none are. */
+	function loggedMessagesAt(log: any, txnLogKey: number, nodeId: number): Set<string> | null {
+		// a first delivery finds nothing at its key: answer that from the log itself, which costs a fraction of a
+		// decoded range read; a frame the probe cannot read is left to the range read, which reports it
+		try {
+			const probe = log.query({ start: txnLogKey, exactStart: true });
+			const found = !probe.next().done;
+			probe.close();
+			if (!found) return null;
+		} catch {
+			// read below through the range, which reports a broken frame
+		}
+		let logged: Set<string> | null = null;
+		for (const entry of auditStore.getRange({ start: txnLogKey, exactStart: true, log: nodeId })) {
+			if (entry.txnLogKey !== txnLogKey) break;
+			if (entry.type === 'message')
+				(logged ??= new Set()).add(messageIdentity(entry.tableId, entry.recordId, entry.version));
+		}
+		return logged;
 	}
 
 	/**
