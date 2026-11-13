@@ -220,6 +220,14 @@ describe('A publish older than its record', function () {
 			assert.deepEqual(await backfill('s7', { startTime: at(35_000) }), [2]);
 		});
 
+		onRocksDB('backfills a late message from a transaction that also writes thousands of other records', async () => {
+			await publish('s9', 2, at(30_000));
+			const writes = Array.from({ length: 3_000 }, (_, n) => ({ id: `other-${n}`, record: { id: `other-${n}` } }));
+			writes.push({ id: 's9', message: { n: 1 } });
+			await apply(at(20_000), peerB, writes);
+			assert.deepEqual(sorted(await backfill('s9', { startTime: at(0) })), [1, 2]);
+		});
+
 		onRocksDB('follows refs only to late writes when every log key differs from its version', async () => {
 			for (let n = 1; n <= 20; n++)
 				await apply(at(n * 1_000 + 7), peerA, [{ id: 's8', message: { n }, version: at(n * 1_000) }]);

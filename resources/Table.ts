@@ -863,6 +863,10 @@ const MAX_OUT_OF_ORDER_AUDIT_DEPTH = 1000;
 // a full walk of the retained audit log — this bounds that walk regardless of how many
 // records the filter accepts.
 const MAX_PREVIOUS_COUNT_SCAN = 10_000;
+// Entries a replay may read in transactions that refs name, across every record they hold.
+const MAX_LATE_SCAN_ENTRIES = 100_000;
+// The writer node of a live event queued behind a replay, to match it against a replayed late message.
+const QUEUED_ORIGIN = Symbol('queued-origin');
 const VERSION_CAP_REFUSAL = `More than ${MAX_PREVIOUS_COUNT_SCAN} versions follow this resume position; resubscribe to resynchronize`;
 const RELOAD_REFUSAL =
 	'A bulk reload after this resume position left rows with no history; resubscribe to resynchronize';
@@ -2318,7 +2322,7 @@ export function makeTable(options): TableResourceClass {
 	 * then each later entry's previous refs, and each late entry's own previous refs for the ones before it
 	 * (`_writePublish`, `_writeUpdate`). Yields each transaction `pending` names that `seen` and `skip` do not,
 	 * with this record's late entries; `found` is false when the log no longer holds the record there. Every
-	 * entry read spends `budget.remaining`; at zero it yields `capped`.
+	 * entry read spends `budget.remaining`; at zero it yields `capped`. A `pause` lets the caller yield mid-read.
 	 */
 	function* lateTransactions(
 		id: Id,
@@ -2326,7 +2330,14 @@ export function makeTable(options): TableResourceClass {
 		seen: Set<string>,
 		budget: { remaining: number },
 		skip?: (key: number) => boolean
-	): Generator<{ key: number; entries: AuditRecord[]; found: boolean; capped: boolean; range: any }> {
+	): Generator<{
+		pause?: true;
+		key?: number;
+		entries?: AuditRecord[];
+		found?: boolean;
+		capped?: boolean;
+		range?: any;
+	}> {
 		while (pending.length > 0) {
 			const ref = pending.pop()!;
 			const identity = `${ref.nodeId ?? 0}:${ref.version}`;
@@ -2342,11 +2353,16 @@ export function makeTable(options): TableResourceClass {
 			const entries: AuditRecord[] = [];
 			let found = false;
 			let capped = false;
+			let sincePause = 0;
 			for (const entry of range) {
 				if (entry.txnLogKey !== ref.version) break;
 				if (--budget.remaining < 0) {
 					capped = true;
 					break;
+				}
+				if (++sincePause >= REPLAY_YIELD_INTERVAL) {
+					sincePause = 0;
+					yield { pause: true };
 				}
 				if (
 					entry.tableId !== tableId ||
@@ -10249,8 +10265,10 @@ export function makeTable(options): TableResourceClass {
 						if (reportingProgress) event[ORIGIN_ID] = auditRecord.nodeId ?? 0;
 						// Queued events are filtered when the queue drains through send() below; events sent
 						// directly (queue already drained) are filtered here. Each event is filtered once.
-						if (pendingRealTimeQueue) pendingRealTimeQueue.push(event);
-						else {
+						if (pendingRealTimeQueue) {
+							event[QUEUED_ORIGIN] = auditRecord.nodeId ?? 0;
+							pendingRealTimeQueue.push(event);
+						} else {
 							if (allowsEvent && !allowsEvent(event)) return;
 							if (databaseName !== 'system') {
 								recordAction(auditRecord.size ?? 1, 'db-message', tableName, null);
@@ -10916,17 +10934,19 @@ export function makeTable(options): TableResourceClass {
 						} while (nextTime > startTime && count !== 0);
 						if (lateRefs.length > 0 && inspected <= MAX_PREVIOUS_COUNT_SCAN) {
 							let lateEvents: any[] | undefined;
-							const budget = { remaining: MAX_PREVIOUS_COUNT_SCAN };
-							for (const { key, entries, found, capped } of lateTransactions(
+							const lateOrigins = new Map<any, number>();
+							const budget = { remaining: MAX_LATE_SCAN_ENTRIES };
+							for (const { pause, key, entries, found, capped } of lateTransactions(
 								thisId,
 								lateRefs,
 								chainTransactions,
 								budget
 							)) {
-								if (++recordsSinceYield >= REPLAY_YIELD_INTERVAL) {
+								if (pause || ++recordsSinceYield >= REPLAY_YIELD_INTERVAL) {
 									recordsSinceYield = 0;
 									await rest();
 									if (!isActive()) return;
+									if (pause) continue;
 								}
 								if (capped || ++inspected > MAX_PREVIOUS_COUNT_SCAN) {
 									inspected = MAX_PREVIOUS_COUNT_SCAN + 1;
@@ -10938,8 +10958,10 @@ export function makeTable(options): TableResourceClass {
 									if (auditRecord.type !== 'message') continue;
 									const event = eventFromAudit(thisId, auditRecord, key, undefined, undefined, replayMemo);
 									if (event && reportingProgress) event[ORIGIN_ID] = auditRecord.nodeId ?? 0;
-									if (event && (!allowsEvent || allowsEvent(event))) (lateEvents ??= []).push(event);
-									else if (!isActive()) return;
+									if (event && (!allowsEvent || allowsEvent(event))) {
+										(lateEvents ??= []).push(event);
+										lateOrigins.set(event, auditRecord.nodeId ?? 0);
+									} else if (!isActive()) return;
 								}
 							}
 							if (lateEvents) {
@@ -10952,13 +10974,16 @@ export function makeTable(options): TableResourceClass {
 								if (pendingRealTimeQueue) {
 									const replayed = new Map<string, number>();
 									for (const event of history) {
-										const identity = `${event.localTime}|${event.version}`;
+										const origin = lateOrigins.get(event);
+										if (origin === undefined) continue;
+										const identity = `${origin}|${event.localTime}|${event.version}`;
 										replayed.set(identity, (replayed.get(identity) ?? 0) + 1);
 									}
 									pendingRealTimeQueue = pendingRealTimeQueue.filter((event) => {
-										const identity = `${event.localTime}|${event.version}`;
+										if (event.type !== 'message') return true;
+										const identity = `${event[QUEUED_ORIGIN]}|${event.localTime}|${event.version}`;
 										const left = replayed.get(identity);
-										if (!left || event.type !== 'message') return true;
+										if (!left) return true;
 										replayed.set(identity, left - 1);
 										return false;
 									});
@@ -12661,10 +12686,11 @@ export function makeTable(options): TableResourceClass {
 					let lateItems: any[] | undefined;
 					let sinceYield = 0;
 					const budget = { remaining: Infinity };
-					for (const { entries, range } of lateTransactions(id, lateRefs, new Set(), budget, inWindow)) {
-						if (++sinceYield >= REPLAY_YIELD_INTERVAL) {
+					for (const { pause, entries, range } of lateTransactions(id, lateRefs, new Set(), budget, inWindow)) {
+						if (pause || ++sinceYield >= REPLAY_YIELD_INTERVAL) {
 							sinceYield = 0;
 							await rest();
+							if (pause) continue;
 						}
 						historyEntry.memo.beginRange();
 						for (const auditRecord of entries) {
