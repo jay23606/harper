@@ -863,9 +863,7 @@ const MAX_OUT_OF_ORDER_AUDIT_DEPTH = 1000;
 // a full walk of the retained audit log — this bounds that walk regardless of how many
 // records the filter accepts.
 const MAX_PREVIOUS_COUNT_SCAN = 10_000;
-// Entries a replay may read in transactions that refs name, across every record they hold.
 const MAX_LATE_SCAN_ENTRIES = 100_000;
-// The writer node of a live event queued behind a replay, to match it against a replayed late message.
 const QUEUED_ORIGIN = Symbol('queued-origin');
 const VERSION_CAP_REFUSAL = `More than ${MAX_PREVIOUS_COUNT_SCAN} versions follow this resume position; resubscribe to resynchronize`;
 const RELOAD_REFUSAL =
@@ -2313,23 +2311,18 @@ export function makeTable(options): TableResourceClass {
 		}
 		return refs;
 	}
-	/** RocksDB keeps no previous node, so a tie counts as late: a tied entry reached through a ref is off the chain. */
+	// RocksDB stores no previous node, so a tie counts as late
 	function isLateEntry(entry: AuditRecord): boolean {
 		return entry.previousVersion >= entry.version;
 	}
-	/**
-	 * A write older than its record leaves the version chain untouched, so only refs reach it: the record's refs,
-	 * then each later entry's previous refs, and each late entry's own previous refs for the ones before it
-	 * (`_writePublish`, `_writeUpdate`). Yields each transaction `pending` names that `seen` and `skip` do not,
-	 * with this record's late entries; `found` is false when the log no longer holds the record there. Every
-	 * entry read spends `budget.remaining`; at zero it yields `capped`. A `pause` lets the caller yield mid-read.
-	 */
+	const transactionIdentity = (nodeId: number | undefined, key: number) =>
+		`${nodeId ?? getThisNodeId(auditStore) ?? 0}:${key}`;
+	/** A write older than its record is off the version chain; only refs, and late entries' own refs, reach it. */
 	function* lateTransactions(
 		id: Id,
 		pending: Array<{ version: number; nodeId: number }>,
 		seen: Set<string>,
-		budget: { remaining: number },
-		skip?: (key: number) => boolean
+		budget: { remaining: number }
 	): Generator<{
 		pause?: true;
 		key?: number;
@@ -2340,8 +2333,8 @@ export function makeTable(options): TableResourceClass {
 	}> {
 		while (pending.length > 0) {
 			const ref = pending.pop()!;
-			const identity = `${ref.nodeId ?? 0}:${ref.version}`;
-			if (seen.has(identity) || skip?.(ref.version)) continue;
+			const identity = transactionIdentity(ref.nodeId, ref.version);
+			if (seen.has(identity)) continue;
 			seen.add(identity);
 			const sharedLog = typeof ref.nodeId === 'number' && ref.nodeId !== 0 && !auditStore.logById(ref.nodeId);
 			const range = auditStore.getRange({
@@ -7391,7 +7384,6 @@ export function makeTable(options): TableResourceClass {
 										write.skipped = true;
 										return;
 									}
-									// a late message never changed the record, so it neither supersedes this write nor ends the walk
 									if (auditRecord.type === 'message' && auditRecord.version < txnTime && !extraFrameEntries) {
 										advanceToPreviousAudit(auditRecord);
 										continue;
@@ -10902,8 +10894,8 @@ export function makeTable(options): TableResourceClass {
 							const auditRecord = auditStore.getSync(nextTime, tableId, thisId, nodeId, true);
 							if (auditRecord && !(checkResume && auditRecord.type === undefined)) {
 								if (isRocksDB) {
-									chainTransactions.add(`${auditRecord.nodeId ?? 0}:${nextTime}`);
-									chainTransactions.add(`${nodeId ?? 0}:${nextTime}`);
+									chainTransactions.add(transactionIdentity(auditRecord.nodeId, nextTime));
+									chainTransactions.add(transactionIdentity(nodeId, nextTime));
 									if (auditRecord.previousAdditionalAuditRefs)
 										lateRefs.push(...auditRecord.previousAdditionalAuditRefs);
 								}
@@ -10926,7 +10918,7 @@ export function makeTable(options): TableResourceClass {
 									: { txnLogKey: auditRecord.previousVersion, nodeId: auditRecord.previousNodeId };
 								nextTime = previousHead.txnLogKey;
 								nodeId = previousHead.nodeId;
-								if (isRocksDB) chainTransactions.add(`${nodeId ?? 0}:${nextTime}`);
+								if (isRocksDB) chainTransactions.add(transactionIdentity(nodeId, nextTime));
 							} else {
 								missingVersion = true;
 								break;
@@ -10966,7 +10958,7 @@ export function makeTable(options): TableResourceClass {
 							}
 							if (lateEvents) {
 								request.omitCurrent = true;
-								history.push(...lateEvents);
+								for (const event of lateEvents) history.push(event);
 								history.sort((a, b) => b.version - a.version);
 								if (wanted > 0 && history.length > wanted) history.length = wanted;
 								// the live gate is one key across origins, so a replayed late message that also committed during
@@ -11294,8 +11286,7 @@ export function makeTable(options): TableResourceClass {
 					const base = priorStagedOp?.stagedEntry ?? existingEntry;
 					const value = base?.value ?? null;
 					const metadataFlags = (base?.metadataFlags ?? 0) & (LOCAL_ONLY | INVALIDATED | REPLICA);
-					// Puts order against the record's version, so a message older than it (a late replicated one, or a
-					// local one behind a peer's clock) is logged and delivered without moving the record back.
+					// a message older than the record never moves its version back: later writes order against it
 					const late =
 						existingEntry?.version !== undefined &&
 						precedesExistingVersion(txnTime, existingEntry, options?.nodeId) < 0;
@@ -11316,7 +11307,7 @@ export function makeTable(options): TableResourceClass {
 						true,
 						{
 							recordVersion: late ? txnTime : undefined,
-							recordNodeId: late ? existingEntry.nodeId : undefined,
+							recordNodeId: late ? (existingEntry.nodeId ?? -1) : undefined,
 							user: (context as any)?.user,
 							// the message's residency routes it; the record keeps its own
 							residencyId: residencyPolicy ? undefined : options?.residencyId,
@@ -12644,7 +12635,7 @@ export function makeTable(options): TableResourceClass {
 				let start: number;
 				let endsAtUnlinkedWrite: boolean;
 				const lateRefs = isRocksDB && entry.additionalAuditRefs ? [...entry.additionalAuditRefs] : [];
-				const windows: Array<[number, number]> = [];
+				const returned = new Set<string>();
 				do {
 					await rest(); // yield to other async operations
 					const windowItems = [];
@@ -12659,8 +12650,10 @@ export function makeTable(options): TableResourceClass {
 						if (matches && isHistoryEntry(auditRecord)) {
 							const oldestInWindow = windowItems.length === 0;
 							windowItems.push(historyEntry(auditRecord));
-							if (isRocksDB && auditRecord.previousAdditionalAuditRefs)
-								lateRefs.push(...auditRecord.previousAdditionalAuditRefs);
+							if (isRocksDB) {
+								returned.add(transactionIdentity(auditRecord.nodeId, auditRecord.txnLogKey));
+								if (auditRecord.previousAdditionalAuditRefs) lateRefs.push(...auditRecord.previousAdditionalAuditRefs);
+							}
 							const previousVersion = isRocksDB
 								? resolveAuditHead(
 										id,
@@ -12676,17 +12669,15 @@ export function makeTable(options): TableResourceClass {
 						}
 					}
 					historyEntry.memo.finishRange(range);
-					windows.push([start, nextVersion + 0.001]);
 					for (const item of windowItems.reverse()) history.push(item);
 					nextVersion = highestPreviousVersion;
 				} while (nextVersion);
 				history.reverse();
 				if (lateRefs.length > 0) {
-					const inWindow = (key: number) => windows.some(([from, to]) => key >= from && key < to);
 					let lateItems: any[] | undefined;
 					let sinceYield = 0;
 					const budget = { remaining: Infinity };
-					for (const { pause, entries, range } of lateTransactions(id, lateRefs, new Set(), budget, inWindow)) {
+					for (const { pause, entries, range } of lateTransactions(id, lateRefs, returned, budget)) {
 						if (pause || ++sinceYield >= REPLAY_YIELD_INTERVAL) {
 							sinceYield = 0;
 							await rest();
@@ -12700,7 +12691,7 @@ export function makeTable(options): TableResourceClass {
 						historyEntry.memo.finishRange(range);
 					}
 					if (lateItems) {
-						history.push(...lateItems);
+						for (const item of lateItems) history.push(item);
 						history.sort((a, b) => a.version - b.version);
 					}
 				}
@@ -16357,7 +16348,7 @@ function auditRefIndex(refs: Array<{ version?: number; nodeId?: number }>, versi
 	}
 	return -1;
 }
-/** The encoder never drops a record's last ref, and the entry it names carries the refs before it. */
+// last, because the encoder never drops a record's last ref
 function withAuditRef(
 	refs: Array<{ version: number; nodeId: number }> | undefined,
 	version: number,

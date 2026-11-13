@@ -50,6 +50,7 @@ describe('A publish older than its record', function () {
 				const resource = await Topics.getResource(write.id, context);
 				const options = { isNotification: true, nodeId, version: write.version ?? key };
 				if (write.message) resource._writePublish(write.id, write.message, options);
+				else if (write.remove) await resource._writeDelete(write.id, options);
 				else await resource._writeUpdate(write.id, write.record, write.fullUpdate ?? true, options);
 			}
 		});
@@ -116,6 +117,13 @@ describe('A publish older than its record', function () {
 			await put('d4', 'C', ahead - 30_000, peerB);
 			const entry = Topics.primaryStore.getEntry('d4');
 			assert.deepEqual({ name: entry.value.name, behindPeer: ahead - entry.version }, { name: 'B', behindPeer: 0 });
+		});
+
+		it('keeps the record when a delete older than it arrives after a late publish (#3637)', async () => {
+			await put('d5', 'B', at(200));
+			await publish('d5', 1, at(150));
+			await apply(at(170), peerA, [{ id: 'd5', remove: true }]);
+			assert.deepEqual(recordState('d5'), { name: 'B', version: 200 });
 		});
 
 		it('applies a late put older than an in-order publish but newer than the record’s last write', async () => {
