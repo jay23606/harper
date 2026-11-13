@@ -2309,6 +2309,59 @@ export function makeTable(options): TableResourceClass {
 		}
 		return refs;
 	}
+	/** An entry written below the record's version: its previous version, the record's then, is not older. */
+	function isLateEntry(entry: AuditRecord): boolean {
+		const previousVersion = entry.previousVersion;
+		if (!(previousVersion >= entry.version)) return false;
+		if (previousVersion > entry.version) return true;
+		return (
+			precedesExistingVersion(entry.version, { version: previousVersion, nodeId: entry.previousNodeId }, entry.nodeId) <
+			0
+		);
+	}
+	/**
+	 * A write older than its record leaves the version chain untouched, so only refs reach it: the record's refs,
+	 * then each later entry's previous refs, and each late entry's own previous refs for the ones before it
+	 * (`_writePublish`, `_writeUpdate`). Yields every transaction `pending` names that `seen` does not, with this
+	 * record's late entries in it; none means the log no longer holds the write the ref named, or it was not late.
+	 */
+	function* lateTransactions(
+		id: Id,
+		pending: Array<{ version: number; nodeId: number }>,
+		seen: Set<string>
+	): Generator<{ key: number; entries: AuditRecord[]; found: boolean; range: any }> {
+		while (pending.length > 0) {
+			const ref = pending.pop()!;
+			const identity = `${ref.nodeId ?? 0}:${ref.version}`;
+			if (seen.has(identity)) continue;
+			seen.add(identity);
+			const sharedLog = typeof ref.nodeId === 'number' && ref.nodeId !== 0 && !auditStore.logById(ref.nodeId);
+			const range = auditStore.getRange({
+				start: ref.version,
+				exactStart: true,
+				log: ref.nodeId,
+				readUncommitted: true,
+			});
+			const entries: AuditRecord[] = [];
+			let found = false;
+			for (const entry of range) {
+				if (entry.txnLogKey !== ref.version) break;
+				if (
+					entry.tableId !== tableId ||
+					compareKeys(entry.recordId, id) !== 0 ||
+					(sharedLog && entry.nodeId !== ref.nodeId)
+				)
+					continue;
+				found = true;
+				if (!isLateEntry(entry)) continue;
+				entries.push(entry);
+				const previousRefs = entry.previousAdditionalAuditRefs;
+				if (previousRefs)
+					for (let index = previousRefs.length - 1; index >= 0; index--) pending.push(previousRefs[index]);
+			}
+			yield { key: ref.version, entries, found, range };
+		}
+	}
 	function resolveAuditHead(
 		id: Id,
 		version: number | undefined,
@@ -7319,6 +7372,11 @@ export function makeTable(options): TableResourceClass {
 										write.skipped = true;
 										return;
 									}
+									// a late message never changed the record, so it neither supersedes this write nor ends the walk
+									if (auditRecord.type === 'message' && auditRecord.version < txnTime && !extraFrameEntries) {
+										advanceToPreviousAudit(auditRecord);
+										continue;
+									}
 									auditedVersion = auditRecord.version;
 									let hasNewerEntryInFrame = false;
 									if (auditedVersion >= txnTime) {
@@ -10796,7 +10854,12 @@ export function makeTable(options): TableResourceClass {
 						nodeId = head.nodeId;
 					}
 					logger.trace?.('Subscription from', startTime, 'from', thisId, localTime);
-					if (startTime < localTime) {
+					// a late message can sit at a log key above the head's
+					let newestRefKey = 0;
+					if (isRocksDB)
+						for (const ref of entry?.additionalAuditRefs ?? [])
+							if (ref.version > newestRefKey) newestRefKey = ref.version;
+					if (startTime < localTime || startTime < newestRefKey) {
 						// start time specified, get the audit history for this record. Set startTime up
 						// front so the listener gate skips any in-flight 'committed' for this version
 						// during the yields below — otherwise that event would be queued and drained as a
@@ -10806,6 +10869,8 @@ export function makeTable(options): TableResourceClass {
 						let inspected = 0;
 						let missingVersion = false;
 						let nextTime = localTime;
+						const lateRefs = isRocksDB && entry?.additionalAuditRefs ? [...entry.additionalAuditRefs] : [];
+						const chainTransactions = new Set<string>();
 						do {
 							if (++recordsSinceYield >= REPLAY_YIELD_INTERVAL) {
 								recordsSinceYield = 0;
@@ -10815,6 +10880,12 @@ export function makeTable(options): TableResourceClass {
 							if (++inspected > MAX_PREVIOUS_COUNT_SCAN) break;
 							const auditRecord = auditStore.getSync(nextTime, tableId, thisId, nodeId, true);
 							if (auditRecord && !(checkResume && auditRecord.type === undefined)) {
+								if (isRocksDB) {
+									chainTransactions.add(`${auditRecord.nodeId ?? 0}:${nextTime}`);
+									chainTransactions.add(`${nodeId ?? 0}:${nextTime}`);
+									if (auditRecord.previousAdditionalAuditRefs)
+										lateRefs.push(...auditRecord.previousAdditionalAuditRefs);
+								}
 								if (startTime < nextTime) {
 									const event = eventFromAudit(thisId, auditRecord, nextTime, undefined, undefined, replayMemo);
 									if (event && reportingProgress) event[ORIGIN_ID] = auditRecord.nodeId ?? 0;
@@ -10839,6 +10910,36 @@ export function makeTable(options): TableResourceClass {
 								break;
 							}
 						} while (nextTime > startTime && count !== 0);
+						if (lateRefs.length > 0 && inspected <= MAX_PREVIOUS_COUNT_SCAN) {
+							let lateEvents: any[] | undefined;
+							for (const { key, entries, found } of lateTransactions(thisId, lateRefs, chainTransactions)) {
+								if (++recordsSinceYield >= REPLAY_YIELD_INTERVAL) {
+									recordsSinceYield = 0;
+									await rest();
+									if (!isActive()) return;
+								}
+								if (++inspected > MAX_PREVIOUS_COUNT_SCAN) break;
+								if (!(startTime < key)) continue;
+								if (!found) missingVersion = true;
+								for (const auditRecord of entries) {
+									if (auditRecord.type !== 'message') continue;
+									const event = eventFromAudit(thisId, auditRecord, key, undefined, undefined, replayMemo);
+									if (event && reportingProgress) event[ORIGIN_ID] = auditRecord.nodeId ?? 0;
+									if (event && (!allowsEvent || allowsEvent(event))) (lateEvents ??= []).push(event);
+									else if (!isActive()) return;
+								}
+							}
+							if (lateEvents) {
+								request.omitCurrent = true;
+								// newest first, like the chain; a count keeps the newest of both
+								history.push(...lateEvents);
+								history.sort((a, b) => b.version - a.version);
+								if (request.previousCount != null && history.length > request.previousCount)
+									history.length = request.previousCount;
+								for (const event of lateEvents)
+									if (event.localTime > subscription!.startTime) subscription!.startTime = event.localTime;
+							}
+						}
 						const capped = inspected > MAX_PREVIOUS_COUNT_SCAN;
 						if (checkResume) {
 							if (capped || missingVersion) {
@@ -11143,15 +11244,29 @@ export function makeTable(options): TableResourceClass {
 					const base = priorStagedOp?.stagedEntry ?? existingEntry;
 					const value = base?.value ?? null;
 					const metadataFlags = (base?.metadataFlags ?? 0) & (LOCAL_ONLY | INVALIDATED | REPLICA);
+					// Puts order against the record's version, so a message older than it (a late replicated one, or a
+					// local one behind a peer's clock) is logged and delivered without moving the record back.
+					const late =
+						existingEntry?.version !== undefined &&
+						precedesExistingVersion(txnTime, existingEntry, options?.nodeId) < 0;
+					const ownRefs = late
+						? isRocksDB
+							? withAuditRef(existingEntry.additionalAuditRefs, appendedLogKey, options?.nodeId)
+							: undefined
+						: appendedLogKey !== txnTime
+							? [{ version: appendedLogKey, nodeId: options?.nodeId }]
+							: undefined;
 					// TODO: Use direct writes in the future (copying binary data is hard because it invalidates the cache)
 					const result = updateRecord(
 						id,
 						value,
 						existingEntry,
-						txnTime,
+						late ? existingEntry.version : txnTime,
 						metadataFlags,
 						true,
 						{
+							recordVersion: late ? txnTime : undefined,
+							recordNodeId: late ? existingEntry.nodeId : undefined,
 							user: (context as any)?.user,
 							// the message's residency routes it; the record keeps its own
 							residencyId: residencyPolicy ? undefined : options?.residencyId,
@@ -11168,18 +11283,8 @@ export function makeTable(options): TableResourceClass {
 							auditLocalOnly: options?.localOnly,
 							additionalAuditRefs:
 								transaction?.isRetry || options?.auditEntry
-									? withRefsMissedByLoggedEntry(
-											appendedLogKey !== txnTime ? [{ version: appendedLogKey, nodeId: options?.nodeId }] : undefined,
-											id,
-											existingEntry,
-											appendedLogKey,
-											write,
-											transaction,
-											options
-										)
-									: appendedLogKey !== txnTime
-										? [{ version: appendedLogKey, nodeId: options?.nodeId }]
-										: undefined,
+									? withRefsMissedByLoggedEntry(ownRefs, id, existingEntry, appendedLogKey, write, transaction, options)
+									: ownRefs,
 							receivedIdentityRefs: audit ? undefined : base?.receivedIdentityRefs,
 						},
 						'message',
@@ -12488,12 +12593,15 @@ export function makeTable(options): TableResourceClass {
 				const auditWindow = 100;
 				let start: number;
 				let endsAtUnlinkedWrite: boolean;
+				const lateRefs = isRocksDB && entry.additionalAuditRefs ? [...entry.additionalAuditRefs] : [];
+				const windows: Array<[number, number]> = [];
 				do {
 					await rest(); // yield to other async operations
 					const windowItems = [];
 					let highestPreviousVersion = 0;
 					start = nextVersion - auditWindow;
 					endsAtUnlinkedWrite = false;
+					windows.push([start, nextVersion + 0.001]);
 					historyEntry.memo.beginRange();
 					const range = auditStore.getRange({ start, end: nextVersion + 0.001 });
 					for (const auditRecord of range) {
@@ -12502,6 +12610,8 @@ export function makeTable(options): TableResourceClass {
 						if (matches && isHistoryEntry(auditRecord)) {
 							const oldestInWindow = windowItems.length === 0;
 							windowItems.push(historyEntry(auditRecord));
+							if (isRocksDB && auditRecord.previousAdditionalAuditRefs)
+								lateRefs.push(...auditRecord.previousAdditionalAuditRefs);
 							const previousVersion = isRocksDB
 								? resolveAuditHead(
 										id,
@@ -12521,6 +12631,28 @@ export function makeTable(options): TableResourceClass {
 					nextVersion = highestPreviousVersion;
 				} while (nextVersion);
 				history.reverse();
+				if (lateRefs.length > 0) {
+					const inWindow = (key: number) => windows.some(([from, to]) => key >= from && key < to);
+					let lateItems: any[] | undefined;
+					let sinceYield = 0;
+					for (const { key, entries, range } of lateTransactions(id, lateRefs, new Set())) {
+						if (++sinceYield >= REPLAY_YIELD_INTERVAL) {
+							sinceYield = 0;
+							await rest();
+						}
+						if (inWindow(key)) continue;
+						historyEntry.memo.beginRange();
+						for (const auditRecord of entries) {
+							historyEntry.memo.observe(auditRecord, true);
+							if (auditRecord.type === 'message') (lateItems ??= []).push(historyEntry(auditRecord));
+						}
+						historyEntry.memo.finishRange(range);
+					}
+					if (lateItems) {
+						history.push(...lateItems);
+						history.sort((a, b) => a.version - b.version);
+					}
+				}
 				// a re-insert after eviction has no predecessor link, so an evictable record may have older history
 				if (endsAtUnlinkedWrite && (evictsRecords() || entry.expiresAt != undefined))
 					return await historyEntry.settle((await unlinkedEntries(start)).concat(history));
@@ -16173,6 +16305,16 @@ function auditRefIndex(refs: Array<{ version?: number; nodeId?: number }>, versi
 		if (refs[index].version === version && (refs[index].nodeId ?? 0) === (nodeId ?? 0)) return index;
 	}
 	return -1;
+}
+/** A copy of `refs` ending with this ref: the encoder keeps the last one, and the entry it names carries the rest. */
+function withAuditRef(
+	refs: Array<{ version: number; nodeId: number }> | undefined,
+	version: number,
+	nodeId: number | undefined
+): Array<{ version: number; nodeId: number }> {
+	const result = refs ? refs.filter((ref) => ref.version !== version || (ref.nodeId ?? 0) !== (nodeId ?? 0)) : [];
+	result.push({ version, nodeId });
+	return result;
 }
 
 const RELATED_READS_IN_FLIGHT = 16;
