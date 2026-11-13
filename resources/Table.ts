@@ -2309,31 +2309,28 @@ export function makeTable(options): TableResourceClass {
 		}
 		return refs;
 	}
-	/** An entry written below the record's version: its previous version, the record's then, is not older. */
+	/** RocksDB keeps no previous node, so a tie counts as late: a tied entry reached through a ref is off the chain. */
 	function isLateEntry(entry: AuditRecord): boolean {
-		const previousVersion = entry.previousVersion;
-		if (!(previousVersion >= entry.version)) return false;
-		if (previousVersion > entry.version) return true;
-		return (
-			precedesExistingVersion(entry.version, { version: previousVersion, nodeId: entry.previousNodeId }, entry.nodeId) <
-			0
-		);
+		return entry.previousVersion >= entry.version;
 	}
 	/**
 	 * A write older than its record leaves the version chain untouched, so only refs reach it: the record's refs,
 	 * then each later entry's previous refs, and each late entry's own previous refs for the ones before it
-	 * (`_writePublish`, `_writeUpdate`). Yields every transaction `pending` names that `seen` does not, with this
-	 * record's late entries in it; none means the log no longer holds the write the ref named, or it was not late.
+	 * (`_writePublish`, `_writeUpdate`). Yields each transaction `pending` names that `seen` and `skip` do not,
+	 * with this record's late entries; `found` is false when the log no longer holds the record there. Every
+	 * entry read spends `budget.remaining`; at zero it yields `capped`.
 	 */
 	function* lateTransactions(
 		id: Id,
 		pending: Array<{ version: number; nodeId: number }>,
-		seen: Set<string>
-	): Generator<{ key: number; entries: AuditRecord[]; found: boolean; range: any }> {
+		seen: Set<string>,
+		budget: { remaining: number },
+		skip?: (key: number) => boolean
+	): Generator<{ key: number; entries: AuditRecord[]; found: boolean; capped: boolean; range: any }> {
 		while (pending.length > 0) {
 			const ref = pending.pop()!;
 			const identity = `${ref.nodeId ?? 0}:${ref.version}`;
-			if (seen.has(identity)) continue;
+			if (seen.has(identity) || skip?.(ref.version)) continue;
 			seen.add(identity);
 			const sharedLog = typeof ref.nodeId === 'number' && ref.nodeId !== 0 && !auditStore.logById(ref.nodeId);
 			const range = auditStore.getRange({
@@ -2344,8 +2341,13 @@ export function makeTable(options): TableResourceClass {
 			});
 			const entries: AuditRecord[] = [];
 			let found = false;
+			let capped = false;
 			for (const entry of range) {
 				if (entry.txnLogKey !== ref.version) break;
+				if (--budget.remaining < 0) {
+					capped = true;
+					break;
+				}
 				if (
 					entry.tableId !== tableId ||
 					compareKeys(entry.recordId, id) !== 0 ||
@@ -2359,7 +2361,8 @@ export function makeTable(options): TableResourceClass {
 				if (previousRefs)
 					for (let index = previousRefs.length - 1; index >= 0; index--) pending.push(previousRefs[index]);
 			}
-			yield { key: ref.version, entries, found, range };
+			yield { key: ref.version, entries, found, capped, range };
+			if (capped) return;
 		}
 	}
 	function resolveAuditHead(
@@ -10854,7 +10857,6 @@ export function makeTable(options): TableResourceClass {
 						nodeId = head.nodeId;
 					}
 					logger.trace?.('Subscription from', startTime, 'from', thisId, localTime);
-					// a late message can sit at a log key above the head's
 					let newestRefKey = 0;
 					if (isRocksDB)
 						for (const ref of entry?.additionalAuditRefs ?? [])
@@ -10871,6 +10873,7 @@ export function makeTable(options): TableResourceClass {
 						let nextTime = localTime;
 						const lateRefs = isRocksDB && entry?.additionalAuditRefs ? [...entry.additionalAuditRefs] : [];
 						const chainTransactions = new Set<string>();
+						const wanted = count;
 						do {
 							if (++recordsSinceYield >= REPLAY_YIELD_INTERVAL) {
 								recordsSinceYield = 0;
@@ -10905,6 +10908,7 @@ export function makeTable(options): TableResourceClass {
 									: { txnLogKey: auditRecord.previousVersion, nodeId: auditRecord.previousNodeId };
 								nextTime = previousHead.txnLogKey;
 								nodeId = previousHead.nodeId;
+								if (isRocksDB) chainTransactions.add(`${nodeId ?? 0}:${nextTime}`);
 							} else {
 								missingVersion = true;
 								break;
@@ -10912,13 +10916,22 @@ export function makeTable(options): TableResourceClass {
 						} while (nextTime > startTime && count !== 0);
 						if (lateRefs.length > 0 && inspected <= MAX_PREVIOUS_COUNT_SCAN) {
 							let lateEvents: any[] | undefined;
-							for (const { key, entries, found } of lateTransactions(thisId, lateRefs, chainTransactions)) {
+							const budget = { remaining: MAX_PREVIOUS_COUNT_SCAN };
+							for (const { key, entries, found, capped } of lateTransactions(
+								thisId,
+								lateRefs,
+								chainTransactions,
+								budget
+							)) {
 								if (++recordsSinceYield >= REPLAY_YIELD_INTERVAL) {
 									recordsSinceYield = 0;
 									await rest();
 									if (!isActive()) return;
 								}
-								if (++inspected > MAX_PREVIOUS_COUNT_SCAN) break;
+								if (capped || ++inspected > MAX_PREVIOUS_COUNT_SCAN) {
+									inspected = MAX_PREVIOUS_COUNT_SCAN + 1;
+									break;
+								}
 								if (!(startTime < key)) continue;
 								if (!found) missingVersion = true;
 								for (const auditRecord of entries) {
@@ -10931,13 +10944,25 @@ export function makeTable(options): TableResourceClass {
 							}
 							if (lateEvents) {
 								request.omitCurrent = true;
-								// newest first, like the chain; a count keeps the newest of both
 								history.push(...lateEvents);
 								history.sort((a, b) => b.version - a.version);
-								if (request.previousCount != null && history.length > request.previousCount)
-									history.length = request.previousCount;
-								for (const event of lateEvents)
-									if (event.localTime > subscription!.startTime) subscription!.startTime = event.localTime;
+								if (wanted > 0 && history.length > wanted) history.length = wanted;
+								// the live gate is one key across origins, so a replayed late message that also committed during
+								// the replay is dropped from the queue rather than by raising the gate
+								if (pendingRealTimeQueue) {
+									const replayed = new Map<string, number>();
+									for (const event of history) {
+										const identity = `${event.localTime}|${event.version}`;
+										replayed.set(identity, (replayed.get(identity) ?? 0) + 1);
+									}
+									pendingRealTimeQueue = pendingRealTimeQueue.filter((event) => {
+										const identity = `${event.localTime}|${event.version}`;
+										const left = replayed.get(identity);
+										if (!left || event.type !== 'message') return true;
+										replayed.set(identity, left - 1);
+										return false;
+									});
+								}
 							}
 						}
 						const capped = inspected > MAX_PREVIOUS_COUNT_SCAN;
@@ -12601,7 +12626,6 @@ export function makeTable(options): TableResourceClass {
 					let highestPreviousVersion = 0;
 					start = nextVersion - auditWindow;
 					endsAtUnlinkedWrite = false;
-					windows.push([start, nextVersion + 0.001]);
 					historyEntry.memo.beginRange();
 					const range = auditStore.getRange({ start, end: nextVersion + 0.001 });
 					for (const auditRecord of range) {
@@ -12627,6 +12651,7 @@ export function makeTable(options): TableResourceClass {
 						}
 					}
 					historyEntry.memo.finishRange(range);
+					windows.push([start, nextVersion + 0.001]);
 					for (const item of windowItems.reverse()) history.push(item);
 					nextVersion = highestPreviousVersion;
 				} while (nextVersion);
@@ -12635,12 +12660,12 @@ export function makeTable(options): TableResourceClass {
 					const inWindow = (key: number) => windows.some(([from, to]) => key >= from && key < to);
 					let lateItems: any[] | undefined;
 					let sinceYield = 0;
-					for (const { key, entries, range } of lateTransactions(id, lateRefs, new Set())) {
+					const budget = { remaining: Infinity };
+					for (const { entries, range } of lateTransactions(id, lateRefs, new Set(), budget, inWindow)) {
 						if (++sinceYield >= REPLAY_YIELD_INTERVAL) {
 							sinceYield = 0;
 							await rest();
 						}
-						if (inWindow(key)) continue;
 						historyEntry.memo.beginRange();
 						for (const auditRecord of entries) {
 							historyEntry.memo.observe(auditRecord, true);
@@ -16306,7 +16331,7 @@ function auditRefIndex(refs: Array<{ version?: number; nodeId?: number }>, versi
 	}
 	return -1;
 }
-/** A copy of `refs` ending with this ref: the encoder keeps the last one, and the entry it names carries the rest. */
+/** The encoder never drops a record's last ref, and the entry it names carries the refs before it. */
 function withAuditRef(
 	refs: Array<{ version: number; nodeId: number }> | undefined,
 	version: number,

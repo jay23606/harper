@@ -1,5 +1,4 @@
-// A message older than its record is logged and delivered without moving the record's version back, and stays in
-// the record's history. Cases from HarperFast/harper#4360.
+// Cases from HarperFast/harper#4360.
 require('../testUtils');
 const assert = require('node:assert');
 const { setupTestDBPath } = require('../testUtils');
