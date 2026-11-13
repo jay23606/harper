@@ -222,7 +222,6 @@ describe('A publish older than its record', function () {
 
 		onRocksDB('backfills a late message whose log key is above startTime while its record’s is not', async () => {
 			await publish('s7', 3, at(30_000));
-			// committed late at its origin: an older version under a newer log key
 			await apply(at(40_000), peerB, [{ id: 's7', message: { n: 2 }, version: at(20_000) }]);
 			assert.equal(recordState('s7').version, 30_000);
 			assert.deepEqual(await backfill('s7', { startTime: at(35_000) }), [2]);
